@@ -1,0 +1,1060 @@
+
+import os
+import json
+import threading
+from urllib.parse import urlparse
+
+import telebot
+from telebot import types
+
+
+# ============== НАСТРОЙКИ ==============
+
+TOKEN = "9282714728:AAFWcVNHjSkMTRKh4Epn0-_eZWsNt6M3LvE"
+ADMIN_ID = 5692456583
+
+DATA_FILE = "bot_data.json"
+
+START_BALANCE = 1000
+AD_CREATE_COST = 1000
+AD_REWARD = 10
+
+REFERRAL_BONUS = 100
+REFERRAL_TASK_PERCENT = 5
+
+GRAM_PACKAGES = {
+    "buy_400": {"stars": 400, "gram": 5000},
+    "buy_600": {"stars": 600, "gram": 7000},
+    "buy_800": {"stars": 800, "gram": 20000},
+}
+
+if not TOKEN or TOKEN == "ВСТАВЬ_НОВЫЙ_ТОКЕН":
+    raise RuntimeError("Вставь новый токен от BotFather")
+
+bot = telebot.TeleBot(TOKEN)
+
+data_lock = threading.RLock()
+
+waiting_ad_link = set()
+support_waiting = set()
+support_reply_target = {}
+
+
+# ============== БАЗА ДАННЫХ ==============
+
+def default_data():
+    return {
+        "users": {},
+        "ads": {},
+        "next_ad_id": 1,
+        "processed_payments": []
+    }
+
+
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        return default_data()
+
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as file:
+            saved = json.load(file)
+
+        if not isinstance(saved, dict):
+            return default_data()
+
+        saved.setdefault("users", {})
+        saved.setdefault("ads", {})
+        saved.setdefault("next_ad_id", 1)
+        saved.setdefault("processed_payments", [])
+
+        for user in saved["users"].values():
+            user.setdefault("balance", START_BALANCE)
+            user.setdefault("completed", [])
+            user.setdefault("referrals", [])
+            user.setdefault("referrer", None)
+            user.setdefault("referral_bonus_given", False)
+            user.setdefault("referral_earnings", 0)
+
+        for ad in saved["ads"].values():
+            ad.setdefault("status", "pending")
+            ad.setdefault("completed", [])
+
+        return saved
+
+    except (json.JSONDecodeError, OSError):
+        return default_data()
+
+
+data = load_data()
+
+
+def save_data():
+    with data_lock:
+        temporary_file = DATA_FILE + ".tmp"
+
+        with open(temporary_file, "w", encoding="utf-8") as file:
+            json.dump(data, file, ensure_ascii=False, indent=4)
+
+        os.replace(temporary_file, DATA_FILE)
+
+
+def get_user(user_id):
+    user_id = str(user_id)
+
+    with data_lock:
+        if user_id not in data["users"]:
+            data["users"][user_id] = {
+                "balance": START_BALANCE,
+                "completed": [],
+                "referrals": [],
+                "referrer": None,
+                "referral_bonus_given": False,
+                "referral_earnings": 0
+            }
+
+        return data["users"][user_id]
+
+
+def format_balance(value):
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+# ============== КЛАВИАТУРЫ ==============
+
+def main_keyboard(user_id):
+    keyboard = types.ReplyKeyboardMarkup(
+        resize_keyboard=True,
+        row_width=2
+    )
+
+    keyboard.add(
+        types.KeyboardButton("📢 Реклама"),
+        types.KeyboardButton("💰 Баланс")
+    )
+
+    keyboard.add(
+        types.KeyboardButton("👥 Реферальная система"),
+        types.KeyboardButton("💎 Купить GRAM")
+    )
+
+    keyboard.add(types.KeyboardButton("🆘 Поддержка"))
+
+    if int(user_id) == ADMIN_ID:
+        keyboard.add(types.KeyboardButton("🛠 Админ-панель"))
+
+    return keyboard
+
+
+def rules_keyboard():
+    keyboard = types.InlineKeyboardMarkup()
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "✅ Принимаю правила",
+            callback_data="accept_rules"
+        )
+    )
+
+    return keyboard
+
+
+def admin_keyboard():
+    keyboard = types.InlineKeyboardMarkup()
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "📋 Реклама на проверке",
+            callback_data="admin_ads"
+        )
+    )
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "📊 Статистика",
+            callback_data="admin_stats"
+        )
+    )
+
+    return keyboard
+
+
+def moderation_keyboard(ad_id):
+    keyboard = types.InlineKeyboardMarkup()
+
+    keyboard.row(
+        types.InlineKeyboardButton(
+            "✅ Одобрить",
+            callback_data=f"approve_{ad_id}"
+        ),
+        types.InlineKeyboardButton(
+            "❌ Отклонить",
+            callback_data=f"reject_{ad_id}"
+        )
+    )
+
+    return keyboard
+
+
+# ============== ПРАВИЛА РЕКЛАМЫ ==============
+
+AD_RULES = """
+📜 ПРАВИЛА РЕКЛАМЫ PR GRAM
+
+Перед размещением рекламы ознакомьтесь с правилами.
+
+1. Запрещена реклама азартных игр, казино и ставок.
+
+2. Запрещена реклама алкоголя, табака и наркотиков.
+
+3. Запрещены мошенничество, обман и финансовые пирамиды.
+
+4. Запрещены ложные обещания заработка и гарантированной прибыли.
+
+5. Запрещён непристойный и откровенный контент.
+
+6. Рекламодатель должен быть администратором рекламируемого канала.
+
+7. Администрация PR GRAM может отклонить рекламу,
+которая нарушает правила.
+
+8. Отправляя рекламу, вы подтверждаете,
+что согласны с этими правилами.
+
+🤝 Соблюдайте честность и уважение к другим пользователям.
+"""
+
+
+# ============== СТАРТ ==============
+
+@bot.message_handler(commands=["start"])
+def start(message):
+    user_id = message.from_user.id
+    user = get_user(user_id)
+
+    args = message.text.split(maxsplit=1)
+
+    if len(args) > 1 and args[1].startswith("ref_"):
+        try:
+            referrer_id = int(args[1].replace("ref_", ""))
+
+            if (
+                referrer_id != user_id
+                and user["referrer"] is None
+                and str(referrer_id) in data["users"]
+            ):
+                user["referrer"] = referrer_id
+
+                referrer = get_user(referrer_id)
+
+                if str(user_id) not in referrer["referrals"]:
+                    referrer["referrals"].append(str(user_id))
+
+                save_data()
+
+        except ValueError:
+            pass
+
+    bot.send_message(
+        message.chat.id,
+        "👋 Добро пожаловать в PR GRAM!\n\n"
+        "💰 Здесь можно выполнять рекламные задания "
+        "и получать GRAM.",
+        reply_markup=main_keyboard(user_id)
+    )
+
+
+# ============== БАЛАНС ==============
+
+@bot.message_handler(func=lambda m: m.text == "💰 Баланс")
+def balance(message):
+    user = get_user(message.from_user.id)
+
+    bot.send_message(
+        message.chat.id,
+        f"💰 Ваш баланс: {format_balance(user['balance'])} GRAM",
+        reply_markup=main_keyboard(message.from_user.id)
+    )
+
+
+# ============== РЕКЛАМА ==============
+
+@bot.message_handler(func=lambda m: m.text == "📢 Реклама")
+def advertising(message):
+    keyboard = types.InlineKeyboardMarkup()
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "📜 Правила рекламы",
+            callback_data="show_rules"
+        )
+    )
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "➕ Создать рекламу",
+            callback_data="create_ad"
+        )
+    )
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "📋 Смотреть задания",
+            callback_data="show_ads"
+        )
+    )
+
+    bot.send_message(
+        message.chat.id,
+        "📢 Рекламный раздел PR GRAM",
+        reply_markup=keyboard
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "show_rules")
+def show_rules(call):
+    bot.answer_callback_query(call.id)
+
+    bot.send_message(
+        call.message.chat.id,
+        AD_RULES,
+        reply_markup=rules_keyboard()
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "create_ad")
+def create_ad(call):
+    bot.answer_callback_query(call.id)
+
+    bot.send_message(
+        call.message.chat.id,
+        "📜 Перед созданием рекламы прочитайте правила:",
+        reply_markup=rules_keyboard()
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "accept_rules")
+def accept_rules(call):
+    user_id = call.from_user.id
+    user = get_user(user_id)
+
+    bot.answer_callback_query(call.id)
+
+    if user["balance"] < AD_CREATE_COST:
+        bot.send_message(
+            call.message.chat.id,
+            f"❌ Для создания рекламы нужно "
+            f"{AD_CREATE_COST} GRAM.\n"
+            f"Ваш баланс: {format_balance(user['balance'])}"
+        )
+        return
+
+    waiting_ad_link.add(user_id)
+
+    bot.send_message(
+        call.message.chat.id,
+        "📢 Отправьте ссылку на публичный Telegram-канал.\n\n"
+        "Примеры:\n"
+        "@mychannel\n"
+        "https://t.me/mychannel\n\n"
+        "Для отмены отправьте /cancel"
+    )
+
+
+def parse_public_channel_link(value):
+    value = value.strip()
+
+    if value.startswith("@"):
+        username = value[1:]
+
+    else:
+        parsed = urlparse(value)
+
+        if parsed.scheme not in ("http", "https"):
+            return None
+
+        if parsed.netloc.lower() not in (
+            "t.me", "www.t.me", "telegram.me"
+        ):
+            return None
+
+        username = parsed.path.strip("/").split("/")[0]
+
+    if not username:
+        return None
+
+    if not username.replace("_", "").isalnum():
+        return None
+
+    if len(username) < 5:
+        return None
+
+    return "@" + username
+
+
+@bot.message_handler(
+    func=lambda m: m.from_user.id in waiting_ad_link,
+    content_types=["text"]
+)
+def receive_ad_link(message):
+    user_id = message.from_user.id
+
+    if message.text == "/cancel":
+        waiting_ad_link.discard(user_id)
+        bot.send_message(message.chat.id, "❌ Создание рекламы отменено.")
+        return
+
+    channel = parse_public_channel_link(message.text)
+
+    if not channel:
+        bot.send_message(
+            message.chat.id,
+            "❌ Неверная ссылка.\n"
+            "Используй https://t.me/channel или @channel"
+        )
+        return
+
+    try:
+        member = bot.get_chat_member(channel, user_id)
+
+        if member.status not in ("administrator", "creator"):
+            bot.send_message(
+                message.chat.id,
+                "❌ Ты должен быть администратором этого канала."
+            )
+            return
+
+        bot_member = bot.get_chat_member(channel, bot.get_me().id)
+
+        if bot_member.status != "administrator":
+            bot.send_message(
+                message.chat.id,
+                "❌ Добавь бота администратором канала, "
+                "чтобы он мог проверять подписки."
+            )
+            return
+
+    except Exception:
+        bot.send_message(
+            message.chat.id,
+            "❌ Не удалось проверить канал.\n"
+            "Проверь ссылку и права бота."
+        )
+        return
+
+    user = get_user(user_id)
+
+    with data_lock:
+        if user["balance"] < AD_CREATE_COST:
+            waiting_ad_link.discard(user_id)
+            bot.send_message(message.chat.id, "❌ Недостаточно GRAM.")
+            return
+
+        user["balance"] -= AD_CREATE_COST
+
+        ad_id = str(data["next_ad_id"])
+        data["next_ad_id"] += 1
+
+        data["ads"][ad_id] = {
+            "channel": channel,
+            "owner": user_id,
+            "status": "pending",
+            "completed": []
+        }
+
+        save_data()
+
+    waiting_ad_link.discard(user_id)
+
+    bot.send_message(
+        message.chat.id,
+        "✅ Реклама отправлена на проверку.\n"
+        "После одобрения она появится в заданиях."
+    )
+
+    try:
+        bot.send_message(
+            ADMIN_ID,
+            f"📢 Новая реклама\n\n"
+            f"🆔 Номер: {ad_id}\n"
+            f"👤 Автор: {user_id}\n"
+            f"🔗 Канал: {channel}",
+            reply_markup=moderation_keyboard(ad_id)
+        )
+    except Exception:
+        bot.send_message(
+            message.chat.id,
+            "⚠️ Не удалось уведомить администратора. "
+            "Обратись в поддержку."
+        )
+
+
+# ============== ПРОСМОТР ЗАДАНИЙ ==============
+
+@bot.callback_query_handler(func=lambda c: c.data == "show_ads")
+def show_ads(call):
+    bot.answer_callback_query(call.id)
+
+    user_id = call.from_user.id
+    user = get_user(user_id)
+
+    found = False
+
+    for ad_id, ad in list(data["ads"].items()):
+        if ad["status"] != "approved":
+            continue
+
+        if int(ad["owner"]) == user_id:
+            continue
+
+        if str(ad_id) in user["completed"]:
+            continue
+
+        if str(user_id) in ad["completed"]:
+            continue
+
+        found = True
+
+        keyboard = types.InlineKeyboardMarkup()
+
+        keyboard.add(
+            types.InlineKeyboardButton(
+                "🔗 Открыть канал",
+                url="https://t.me/" + ad["channel"].replace("@", "")
+            )
+        )
+
+        keyboard.add(
+            types.InlineKeyboardButton(
+                "✅ Проверить подписку",
+                callback_data=f"check_ad_{ad_id}"
+            )
+        )
+
+        bot.send_message(
+            call.message.chat.id,
+            f"📢 Рекламное задание №{ad_id}\n\n"
+            f"Подпишись на канал:\n{ad['channel']}\n\n"
+            f"🎁 Награда: {AD_REWARD} GRAM",
+            reply_markup=keyboard
+        )
+
+    if not found:
+        bot.send_message(
+            call.message.chat.id,
+            "📭 Сейчас доступных заданий нет."
+        )
+
+
+# ============== ПРОВЕРКА ПОДПИСКИ ==============
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("check_ad_"))
+def check_subscription(call):
+    user_id = call.from_user.id
+    ad_id = call.data.replace("check_ad_", "")
+
+    bot.answer_callback_query(call.id)
+
+    if ad_id not in data["ads"]:
+        bot.send_message(call.message.chat.id, "❌ Задание не найдено.")
+        return
+
+    ad = data["ads"][ad_id]
+
+    if ad["status"] != "approved":
+        bot.send_message(call.message.chat.id, "❌ Задание недоступно.")
+        return
+
+    if int(ad["owner"]) == user_id:
+        bot.send_message(call.message.chat.id, "❌ Нельзя выполнять свою рекламу.")
+        return
+
+    user = get_user(user_id)
+
+    if ad_id in user["completed"]:
+        bot.send_message(call.message.chat.id, "✅ Задание уже выполнено.")
+        return
+
+    try:
+        member = bot.get_chat_member(ad["channel"], user_id)
+
+        if member.status not in ("member", "administrator", "creator"):
+            bot.send_message(
+                call.message.chat.id,
+                "❌ Ты ещё не подписан на канал."
+            )
+            return
+
+    except Exception:
+        bot.send_message(
+            call.message.chat.id,
+            "❌ Не удалось проверить подписку."
+        )
+        return
+
+    with data_lock:
+        if ad_id in user["completed"]:
+            return
+
+        user["completed"].append(ad_id)
+        ad["completed"].append(str(user_id))
+
+        user["balance"] += AD_REWARD
+
+        referrer_id = user.get("referrer")
+
+        if referrer_id:
+            referrer = get_user(referrer_id)
+
+            referral_reward = AD_REWARD * REFERRAL_TASK_PERCENT / 100
+            referrer["balance"] += referral_reward
+            referrer["referral_earnings"] += referral_reward
+
+            if not user["referral_bonus_given"]:
+                referrer["balance"] += REFERRAL_BONUS
+                user["referral_bonus_given"] = True
+
+                try:
+                    bot.send_message(
+                        referrer_id,
+                        f"🎉 Твой приглашённый пользователь "
+                        f"выполнил первое задание!\n"
+                        f"Бонус: {REFERRAL_BONUS} GRAM."
+                    )
+                except Exception:
+                    pass
+
+        save_data()
+
+    bot.send_message(
+        call.message.chat.id,
+        f"🎉 Подписка подтверждена!\n"
+        f"Начислено: {AD_REWARD} GRAM.\n"
+        f"Баланс: {format_balance(user['balance'])} GRAM"
+    )
+
+
+# ============== РЕФЕРАЛЬНАЯ СИСТЕМА ==============
+
+@bot.message_handler(func=lambda m: m.text == "👥 Реферальная система")
+def referral_menu(message):
+    user = get_user(message.from_user.id)
+
+    link = (
+        f"https://t.me/{bot.get_me().username}"
+        f"?start=ref_{message.from_user.id}"
+    )
+
+    bot.send_message(
+        message.chat.id,
+        "👥 РЕФЕРАЛЬНАЯ СИСТЕМА\n\n"
+        f"🔗 Твоя ссылка:\n{link}\n\n"
+        f"👤 Приглашено: {len(user['referrals'])}\n"
+        f"💰 Заработано с заданий: "
+        f"{format_balance(user['referral_earnings'])} GRAM\n\n"
+        f"🎁 Бонус за первое задание друга: "
+        f"{REFERRAL_BONUS} GRAM\n"
+        f"📈 Процент с заданий друга: "
+        f"{REFERRAL_TASK_PERCENT}%"
+    )
+
+
+# ============== ПОКУПКА GRAM ==============
+
+@bot.message_handler(func=lambda m: m.text == "💎 Купить GRAM")
+def buy_gram_menu(message):
+    keyboard = types.InlineKeyboardMarkup()
+
+    for package_id, package in GRAM_PACKAGES.items():
+        keyboard.add(
+            types.InlineKeyboardButton(
+                f"{package['stars']} ⭐ → {package['gram']} GRAM",
+                callback_data=package_id
+            )
+        )
+
+    bot.send_message(
+        message.chat.id,
+        "💎 ПОКУПКА GRAM\n\n"
+        "Выбери пакет для оплаты через Telegram Stars:",
+        reply_markup=keyboard
+    )
+
+
+def create_gram_invoice(chat_id, package_id):
+    package = GRAM_PACKAGES[package_id]
+
+    prices = [
+        types.LabeledPrice(
+            label=f"{package['gram']} GRAM",
+            amount=package["stars"]
+        )
+    ]
+
+    bot.send_invoice(
+        chat_id,
+        title=f"{package['gram']} GRAM",
+        description=f"Покупка {package['gram']} GRAM",
+        invoice_payload=f"gram_{package_id}",
+        provider_token="",
+        currency="XTR",
+        prices=prices
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data in GRAM_PACKAGES)
+def buy_package(call):
+    bot.answer_callback_query(call.id)
+    create_gram_invoice(call.message.chat.id, call.data)
+
+
+@bot.pre_checkout_query_handler(func=lambda query: True)
+def process_pre_checkout(pre_checkout_query):
+    payload = pre_checkout_query.invoice_payload
+
+    if not payload.startswith("gram_"):
+        bot.answer_pre_checkout_query(
+            pre_checkout_query.id,
+            ok=False,
+            error_message="Неизвестный товар."
+        )
+        return
+
+    package_id = payload.replace("gram_", "")
+
+    if package_id not in GRAM_PACKAGES:
+        bot.answer_pre_checkout_query(
+            pre_checkout_query.id,
+            ok=False,
+            error_message="Пакет не найден."
+        )
+        return
+
+    package = GRAM_PACKAGES[package_id]
+
+    if (
+        pre_checkout_query.currency != "XTR"
+        or pre_checkout_query.total_amount != package["stars"]
+    ):
+        bot.answer_pre_checkout_query(
+            pre_checkout_query.id,
+            ok=False,
+            error_message="Неверная сумма оплаты."
+        )
+        return
+
+    bot.answer_pre_checkout_query(
+        pre_checkout_query.id,
+        ok=True
+    )
+
+
+@bot.message_handler(content_types=["successful_payment"])
+def successful_payment(message):
+    payment = message.successful_payment
+    charge_id = payment.telegram_payment_charge_id
+
+    payload = payment.invoice_payload
+
+    if not payload.startswith("gram_"):
+        return
+
+    package_id = payload.replace("gram_", "")
+
+    if package_id not in GRAM_PACKAGES:
+        return
+
+    package = GRAM_PACKAGES[package_id]
+
+    if (
+        payment.currency != "XTR"
+        or payment.total_amount != package["stars"]
+    ):
+        return
+
+    user = get_user(message.from_user.id)
+
+    with data_lock:
+        if charge_id in data["processed_payments"]:
+            return
+
+        user["balance"] += package["gram"]
+        data["processed_payments"].append(charge_id)
+        save_data()
+
+    bot.send_message(
+        message.chat.id,
+        f"✅ Оплата прошла успешно!\n\n"
+        f"Начислено: {package['gram']} GRAM\n"
+        f"Новый баланс: {format_balance(user['balance'])} GRAM",
+        reply_markup=main_keyboard(message.from_user.id)
+    )
+
+
+# ============== АДМИН-ПАНЕЛЬ ==============
+
+@bot.message_handler(func=lambda m: m.text == "🛠 Админ-панель")
+def admin_panel(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    bot.send_message(
+        message.chat.id,
+        "🛠 АДМИН-ПАНЕЛЬ",
+        reply_markup=admin_keyboard()
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_ads")
+def admin_ads(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "Нет доступа.")
+        return
+
+    bot.answer_callback_query(call.id)
+
+    found = False
+
+    for ad_id, ad in list(data["ads"].items()):
+        if ad["status"] != "pending":
+            continue
+
+        found = True
+
+        bot.send_message(
+            ADMIN_ID,
+            f"📢 Реклама на проверке\n\n"
+            f"🆔 Номер: {ad_id}\n"
+            f"👤 Автор: {ad['owner']}\n"
+            f"🔗 Канал: {ad['channel']}",
+            reply_markup=moderation_keyboard(ad_id)
+        )
+
+    if not found:
+        bot.send_message(ADMIN_ID, "📭 Нет рекламы на проверке.")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_stats")
+def admin_stats(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "Нет доступа.")
+        return
+
+    bot.answer_callback_query(call.id)
+
+    bot.send_message(
+        ADMIN_ID,
+        f"📊 СТАТИСТИКА PR GRAM\n\n"
+        f"👥 Пользователей: {len(data['users'])}\n"
+        f"📢 Всего реклам: {len(data['ads'])}\n"
+        f"⏳ На проверке: "
+        f"{sum(1 for a in data['ads'].values() if a['status'] == 'pending')}\n"
+        f"✅ Одобрено: "
+        f"{sum(1 for a in data['ads'].values() if a['status'] == 'approved')}"
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("approve_"))
+def approve_ad(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "Нет доступа.")
+        return
+
+    ad_id = call.data.replace("approve_", "")
+
+    if ad_id not in data["ads"]:
+        bot.answer_callback_query(call.id, "Реклама не найдена.")
+        return
+
+    ad = data["ads"][ad_id]
+
+    if ad["status"] != "pending":
+        bot.answer_callback_query(call.id, "Уже обработано.")
+        return
+
+    ad["status"] = "approved"
+    save_data()
+
+    bot.answer_callback_query(call.id, "Реклама одобрена.")
+
+    bot.send_message(
+        ad["owner"],
+        f"✅ Твоя реклама №{ad_id} одобрена!"
+    )
+
+    bot.send_message(
+        ADMIN_ID,
+        f"✅ Реклама №{ad_id} одобрена."
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("reject_"))
+def reject_ad(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "Нет доступа.")
+        return
+
+    ad_id = call.data.replace("reject_", "")
+
+    if ad_id not in data["ads"]:
+        bot.answer_callback_query(call.id, "Реклама не найдена.")
+        return
+
+    ad = data["ads"][ad_id]
+
+    if ad["status"] != "pending":
+        bot.answer_callback_query(call.id, "Уже обработано.")
+        return
+
+    ad["status"] = "rejected"
+
+    owner = get_user(ad["owner"])
+    owner["balance"] += AD_CREATE_COST
+
+    save_data()
+
+    bot.answer_callback_query(call.id, "Реклама отклонена.")
+
+    bot.send_message(
+        ad["owner"],
+        f"❌ Твоя реклама №{ad_id} отклонена.\n"
+        f"Возвращено: {AD_CREATE_COST} GRAM."
+    )
+
+    bot.send_message(
+        ADMIN_ID,
+        f"❌ Реклама №{ad_id} отклонена. Баланс возвращён."
+    )
+
+
+# ============== ПОДДЕРЖКА ==============
+
+@bot.message_handler(func=lambda m: m.text == "🆘 Поддержка")
+def support_start(message):
+    support_waiting.add(message.from_user.id)
+
+    bot.send_message(
+        message.chat.id,
+        "🆘 ПОДДЕРЖКА PR GRAM\n\n"
+        "Напишите сообщение для администратора.\n"
+        "Ваше сообщение будет передано в поддержку.\n\n"
+        "Для отмены отправьте /cancel"
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.from_user.id in support_waiting,
+    content_types=["text"]
+)
+def support_receive(message):
+    user_id = message.from_user.id
+
+    if message.text == "/cancel":
+        support_waiting.discard(user_id)
+        bot.send_message(message.chat.id, "❌ Обращение отменено.")
+        return
+
+    support_waiting.discard(user_id)
+
+    keyboard = types.InlineKeyboardMarkup()
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "↩️ Ответить",
+            callback_data=f"support_reply_{user_id}"
+        )
+    )
+
+    try:
+        bot.send_message(
+            ADMIN_ID,
+            f"🆘 НОВОЕ ОБРАЩЕНИЕ\n\n"
+            f"👤 Пользователь: {message.from_user.first_name}\n"
+            f"🆔 ID: {user_id}\n\n"
+            f"💬 Сообщение:\n{message.text}",
+            reply_markup=keyboard
+        )
+
+        bot.send_message(
+            message.chat.id,
+            "✅ Сообщение отправлено администратору.\n"
+            "Ожидайте ответа."
+        )
+
+    except Exception:
+        bot.send_message(
+            message.chat.id,
+            "❌ Не удалось отправить сообщение. "
+            "Попробуйте позже."
+        )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("support_reply_")
+)
+def support_reply_button(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "Нет доступа.")
+        return
+
+    try:
+        user_id = int(call.data.replace("support_reply_", ""))
+    except ValueError:
+        bot.answer_callback_query(call.id, "Неверный ID.")
+        return
+
+    support_reply_target[call.from_user.id] = user_id
+
+    bot.answer_callback_query(call.id)
+
+    bot.send_message(
+        call.message.chat.id,
+        f"✍️ Напишите ответ пользователю {user_id}.\n"
+        f"Для отмены отправьте /cancel."
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.from_user.id in support_reply_target,
+    content_types=["text"]
+)
+def support_admin_reply(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    if message.text == "/cancel":
+        support_reply_target.pop(message.from_user.id, None)
+        bot.send_message(message.chat.id, "❌ Ответ отменён.")
+        return
+
+    user_id = support_reply_target.pop(message.from_user.id)
+
+    try:
+        bot.send_message(
+            user_id,
+            f"🆘 ОТВЕТ ПОДДЕРЖКИ\n\n{message.text}"
+        )
+
+        bot.send_message(
+            message.chat.id,
+            "✅ Ответ отправлен пользователю."
+        )
+
+    except Exception:
+        bot.send_message(
+            message.chat.id,
+            "❌ Не удалось отправить ответ.\n"
+            "Возможно, пользователь заблокировал бота."
+        )
+
+
+# ============== ЗАПУСК ==============
+
+print("PR GRAM запущен!")
+
+bot.infinity_polling(
+    skip_pending=True,
+    timeout=30,
+    long_polling_timeout=30
+)
